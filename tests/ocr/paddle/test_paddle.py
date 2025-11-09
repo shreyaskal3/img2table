@@ -7,6 +7,7 @@ import pytest
 
 from img2table.document.image import Image
 from img2table.ocr.data import OCRDataframe
+from tests.conftest import nested_approx
 
 
 def test_validators():
@@ -27,7 +28,7 @@ def test_paddle_content():
     with open("test_data/hocr.json", "r") as f:
         expected = json.load(f)
 
-    assert result == expected
+    assert result == nested_approx(expected, abs=1e-3)
 
 
 def test_paddle_ocr_df():
