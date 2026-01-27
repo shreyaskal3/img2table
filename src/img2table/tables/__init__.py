@@ -20,7 +20,7 @@ def threshold_dark_areas(img: np.ndarray, char_length: Optional[float]) -> np.nd
         gray = 255 - gray
 
     thresh_kernel = int(char_length) // 2 * 2 + 1
-
+    # https://stackoverflow.com/questions/54838591/removing-high-density-noises-from-image-using-opencv-in-python
     # Threshold original image
     t_sauvola = cv2.ximgproc.niBlackThreshold(gray, 255, cv2.THRESH_BINARY_INV, thresh_kernel, 0.2,
                                               binarizationMethod=cv2.ximgproc.BINARIZATION_SAUVOLA)
