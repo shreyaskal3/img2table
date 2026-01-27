@@ -13,3 +13,5 @@ venv
 profiling*
 examples/testing
 .python_version
+# Editor settings
+.vscode/
