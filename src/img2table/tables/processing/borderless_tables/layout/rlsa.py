@@ -4,6 +4,7 @@ Implementation of Adaptive RLSA algorithm based on https://www.sciencedirect.com
 and text line segmentation by
 """
 
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -236,27 +237,51 @@ def get_text_mask(thresh: np.ndarray, cc_stats_rlsa: np.ndarray, char_length: fl
     return text_mask
 
 
-def identify_text_mask(thresh: np.ndarray, lines: list[Line], char_length: float,
-                       existing_tables: Optional[list[Table]] = None) -> np.ndarray:
+def identify_text_mask(
+    thresh: np.ndarray,
+    lines: list[Line],
+    char_length: float,
+    existing_tables: Optional[list[Table]] = None,
+    debug_dir: Optional[str | Path] = None,
+) -> np.ndarray:
     """
     Identify text mask of the input image
     :param thresh: threshold image array
     :param lines: list of image rows
     :param char_length: average character length
     :param existing_tables: list of detected bordered tables
+    :param debug_dir: optional directory to dump debug images
     :return: thresholded image
     """
+    debug_dir_path = Path(debug_dir) if debug_dir is not None else None
+    if debug_dir_path is not None:
+        debug_dir_path.mkdir(parents=True, exist_ok=True)
+
+    def write_debug(name: str, image: np.ndarray) -> None:
+        if debug_dir_path is None:
+            return
+        if image.dtype == np.bool_:
+            image = image.astype(np.uint8) * 255
+        elif image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(debug_dir_path / f"{name}.png"), image)
+
+    write_debug("rlsa_input_thresh", thresh)
+
     # Mask rows in image
+    masked_thresh = thresh.copy()
     for line in lines:
         if line.horizontal and line.length >= 3 * char_length:
-            cv2.rectangle(thresh, (line.x1, line.y1 - line.thickness // 2 - 1), (line.x2, line.y2 + line.thickness // 2 + 1),
+            cv2.rectangle(masked_thresh, (line.x1, line.y1 - line.thickness // 2 - 1), (line.x2, line.y2 + line.thickness // 2 + 1),
                           (0, 0, 0), -1)
         elif line.vertical and line.length >= 2 * char_length:
-            cv2.rectangle(thresh, (line.x1 - line.thickness // 2 - 1, line.y1), (line.x2 + line.thickness // 2 + 1, line.y2),
+            cv2.rectangle(masked_thresh, (line.x1 - line.thickness // 2 - 1, line.y1), (line.x2 + line.thickness // 2 + 1, line.y2),
                           (0, 0, 0), -1)
+    write_debug("rlsa_masked_lines", masked_thresh)
 
     # Apply dilation
-    thresh = cv2.dilate(thresh, kernel=cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1)), iterations=1)
+    thresh = cv2.dilate(masked_thresh, kernel=cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1)), iterations=1)
+    write_debug("rlsa_dilated", thresh)
 
     # Connected components
     _, cc, cc_stats, _ = cv2.connectedComponentsWithStats(thresh, 8, cv2.CV_32S)
@@ -268,20 +293,29 @@ def identify_text_mask(thresh: np.ndarray, lines: list[Line], char_length: float
     average_height = np.mean(cc_stats[1:, cv2.CC_STAT_HEIGHT])
     median_width = np.median(cc_stats[1:, cv2.CC_STAT_WIDTH])
     cc_denoised = remove_noise(cc=cc, cc_stats=cc_stats, average_height=average_height, median_width=median_width)
+    if debug_dir_path is not None:
+        denoised_vis = (cc_denoised > 0).astype(np.uint8) * 255
+        write_debug("rlsa_cc_denoised", denoised_vis)
 
     # Apply small RLSA
     rlsa_small = adaptive_rlsa(cc=cc_denoised, cc_stats=cc_stats, a=1, th=3.5, c=0.4)
     rlsa_small = cv2.erode(255 * (rlsa_small > 0).astype(np.uint8),
                            kernel=cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2)))
+    write_debug("rlsa_small", rlsa_small)
 
     # Identify obstacles and remove them from denoised cc array
     mask_obstacles = find_obstacles(img=np.maximum(rlsa_small, thresh),
                                     min_width=char_length)
+    write_debug("rlsa_obstacles", mask_obstacles)
     cc_obstacles = cc_denoised.copy()
     cc_obstacles[mask_obstacles] = -1
+    if debug_dir_path is not None:
+        obstacles_vis = (cc_obstacles > 0).astype(np.uint8) * 255
+        write_debug("rlsa_cc_obstacles", obstacles_vis)
 
     # RLSA image
     rlsa_image = adaptive_rlsa(cc=cc_obstacles, cc_stats=cc_stats, a=5, th=3.5, c=0.4)
+    write_debug("rlsa_large", 255 * (rlsa_image > 0).astype(np.uint8))
 
     # Connected components of the rlsa image
     _, _, cc_stats_rlsa, _ = cv2.connectedComponentsWithStats(255 * (rlsa_image > 0).astype(np.uint8), 8, cv2.CV_32S)
@@ -291,15 +325,19 @@ def identify_text_mask(thresh: np.ndarray, lines: list[Line], char_length: float
                               cc_stats_rlsa=cc_stats_rlsa,
                               char_length=char_length,
                               median_width=median_width)
+    write_debug("rlsa_text_mask", text_mask)
 
     # Compute final image
     cc_final = cc_obstacles.copy()
     cc_final[~text_mask] = -1
     rlsa_final = adaptive_rlsa(cc=cc_final, cc_stats=cc_stats, a=1.25, th=3.5, c=0.4)
+    write_debug("rlsa_final_mask", 255 * (rlsa_final > 0).astype(np.uint8))
 
     # Remove all elements from existing tables
     for tb in existing_tables or []:
         rlsa_final[tb.y1:tb.y2, tb.x1:tb.x2] = 0
 
-    return cv2.erode(255 * rlsa_final.astype(np.uint8),
-                     kernel=cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2)))
+    out = cv2.erode(255 * rlsa_final.astype(np.uint8),
+                    kernel=cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2)))
+    write_debug("rlsa_output", out)
+    return out

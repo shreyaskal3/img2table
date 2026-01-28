@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -248,14 +249,36 @@ def create_character_thresh(thresh: np.ndarray, stats: np.ndarray, discarded_sta
     return character_thresh, np.array(list_relevant_chars) if list_relevant_chars else np.empty((0, 5), dtype=np.int32)
 
 
-def compute_char_length(thresh: np.ndarray) -> tuple[Optional[float], Optional[np.ndarray], Optional[np.ndarray]]:
+def compute_char_length(
+    thresh: np.ndarray,
+    debug_dir: Optional[str | Path] = None,
+) -> tuple[Optional[float], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Compute average character length based on connected components' analysis
     :param thresh: threshold image array
+    :param debug_dir: optional directory to dump debug images
     :return: tuple with average character length, thresholded image of characters and array of image characters
     """
+    debug_dir_path = Path(debug_dir) if debug_dir is not None else None
+    if debug_dir_path is not None:
+        debug_dir_path.mkdir(parents=True, exist_ok=True)
+
+    def write_debug(name: str, image: np.ndarray) -> None:
+        if debug_dir_path is None:
+            return
+        if image.dtype == np.bool_:
+            image = image.astype(np.uint8) * 255
+        elif image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(debug_dir_path / f"{name}.png"), image)
+
+    write_debug("metrics_thresh", thresh)
+
     # Connected components
     _, cc_labels, stats, _ = cv2.connectedComponentsWithStats(thresh, 8, cv2.CV_32S)
+    if debug_dir_path is not None and cc_labels is not None:
+        label_vis = (cc_labels.astype(np.float32) / max(1, cc_labels.max()) * 255).astype(np.uint8)
+        write_debug("metrics_cc_labels", label_vis)
 
     # Remove dots
     stats = remove_dots(cc_labels=cc_labels, stats=stats)
@@ -278,6 +301,14 @@ def compute_char_length(thresh: np.ndarray) -> tuple[Optional[float], Optional[n
     relevant_stats, discarded_stats = filter_cc(stats=stats)
 
     if len(relevant_stats) > 0:
+        if debug_dir_path is not None:
+            overlay = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+            for x, y, w, h, _ in discarded_stats:
+                cv2.rectangle(overlay, (x, y), (x + w - 1, y + h - 1), (0, 0, 255), 1)
+            for x, y, w, h, _ in relevant_stats:
+                cv2.rectangle(overlay, (x, y), (x + w - 1, y + h - 1), (0, 255, 0), 1)
+            write_debug("metrics_relevant_cc", overlay)
+
         # Compute average character length
         argmax_char_length = float(np.argmax(np.bincount(relevant_stats[:, cv2.CC_STAT_WIDTH])))
         mean_char_length = np.mean(relevant_stats[:, cv2.CC_STAT_WIDTH])
@@ -288,6 +319,7 @@ def compute_char_length(thresh: np.ndarray) -> tuple[Optional[float], Optional[n
                                                                  stats=relevant_stats,
                                                                  discarded_stats=discarded_stats,
                                                                  char_length=char_length)
+        write_debug("metrics_chars_thresh", characters_thresh)
 
         return char_length, characters_thresh, chars_array
     return None, None, None
@@ -363,23 +395,49 @@ def get_row_separations(stats: np.ndarray, char_length: float) -> list[float]:
     return row_separations
 
 
-def compute_median_line_sep(thresh_chars: np.ndarray, chars_array: np.ndarray,
-                            char_length: float) -> tuple[Optional[float], Optional[list[Cell]]]:
+def compute_median_line_sep(
+    thresh_chars: np.ndarray,
+    chars_array: np.ndarray,
+    char_length: float,
+    debug_dir: Optional[str | Path] = None,
+) -> tuple[Optional[float], Optional[list[Cell]]]:
     """
     Compute median separation between rows
     :param thresh_chars: thresholded image of characters
     :param char_length: average character length
+    :param debug_dir: optional directory to dump debug images
     :return: median separation between rows
     """
+    debug_dir_path = Path(debug_dir) if debug_dir is not None else None
+    if debug_dir_path is not None:
+        debug_dir_path.mkdir(parents=True, exist_ok=True)
+
+    def write_debug(name: str, image: np.ndarray) -> None:
+        if debug_dir_path is None:
+            return
+        if image.dtype == np.bool_:
+            image = image.astype(np.uint8) * 255
+        elif image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(debug_dir_path / f"{name}.png"), image)
+
+    write_debug("metrics_thresh_chars", thresh_chars)
+
     # Identify characters that belong to the same word and create merged contours, by closing image and retrieving
     # connected components
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(char_length // 2 + 1), int(char_length // 3 + 1)))
     thresh_chars = cv2.morphologyEx(thresh_chars, cv2.MORPH_CLOSE, kernel)
+    write_debug("metrics_thresh_chars_closed", thresh_chars)
 
     _, _, stats, _ = cv2.connectedComponentsWithStats(thresh_chars, 8, cv2.CV_32S)
 
     # Recompute contours
     stats_contours = recompute_contours(stats=stats, chars_array=chars_array)
+    if debug_dir_path is not None:
+        overlay = cv2.cvtColor(thresh_chars, cv2.COLOR_GRAY2BGR)
+        for x, y, w, h in stats_contours:
+            cv2.rectangle(overlay, (x, y), (x + w - 1, y + h - 1), (255, 0, 0), 1)
+        write_debug("metrics_contours", overlay)
 
     # Compute median line sep
     row_separations = get_row_separations(stats=stats_contours, char_length=char_length)
@@ -393,22 +451,71 @@ def compute_median_line_sep(thresh_chars: np.ndarray, chars_array: np.ndarray,
     else:
         median_line_sep = None
 
+    if debug_dir_path is not None and stats_contours.size > 0:
+        # Debug visualization for row separations using the same logic as the njit function
+        debug_separations: list[tuple[int, int, float]] = []
+        for i in range(stats_contours.shape[0]):
+            xi, yi, wi, hi = stats_contours[i][:]
+            v_pos_i = (2 * yi + hi) / 2
+            best_sep = 10 ** 6
+            best_j = -1
+            for j in range(stats_contours.shape[0]):
+                if i == j:
+                    continue
+                xj, yj, wj, hj = stats_contours[j][:]
+                h_overlap = min(xi + hi, xj + hj) - max(xi, xj)
+                v_pos_j = (2 * yj + hj) / 2
+                if h_overlap <= char_length // 2 or v_pos_j <= v_pos_i:
+                    continue
+                sep = v_pos_j - v_pos_i
+                if sep < best_sep:
+                    best_sep = sep
+                    best_j = j
+            if best_sep < 10 ** 6 and best_j >= 0:
+                debug_separations.append((i, best_j, float(best_sep)))
+
+        sep_overlay = cv2.cvtColor(thresh_chars, cv2.COLOR_GRAY2BGR)
+        for i, j, sep in debug_separations:
+            xi, yi, wi, hi = stats_contours[i][:]
+            xj, yj, wj, hj = stats_contours[j][:]
+            cx_i, cy_i = int(xi + wi / 2), int(yi + hi / 2)
+            cx_j, cy_j = int(xj + wj / 2), int(yj + hj / 2)
+            cv2.line(sep_overlay, (cx_i, cy_i), (cx_j, cy_j), (0, 255, 255), 1)
+            mid_x, mid_y = int((cx_i + cx_j) / 2), int((cy_i + cy_j) / 2)
+            cv2.putText(sep_overlay, f"{sep:.1f}", (mid_x + 2, mid_y - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
+
+        if median_line_sep is not None:
+            cv2.putText(sep_overlay, f"median_line_sep={median_line_sep}", (8, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+        write_debug("metrics_row_separations", sep_overlay)
+
     # Get contours cells
     contours_cells = [Cell(x1=x, y1=y, x2=x + w, y2=y + h)
                       for idx, (x, y, w, h) in enumerate(stats_contours)
                       if idx > 0]
 
+    if debug_dir_path is not None:
+        cells_overlay = cv2.cvtColor(thresh_chars, cv2.COLOR_GRAY2BGR)
+        for cell in contours_cells:
+            cv2.rectangle(cells_overlay, (cell.x1, cell.y1), (cell.x2 - 1, cell.y2 - 1), (0, 128, 255), 1)
+        write_debug("metrics_contours_cells", cells_overlay)
+
     return median_line_sep, contours_cells
 
 
-def compute_img_metrics(thresh: np.ndarray) -> tuple[Optional[float], Optional[float], Optional[list[Cell]]]:
+def compute_img_metrics(
+    thresh: np.ndarray,
+    debug_dir: Optional[str | Path] = None,
+) -> tuple[Optional[float], Optional[float], Optional[list[Cell]]]:
     """
     Compute metrics from image
     :param thresh: threshold image array
+    :param debug_dir: optional directory to dump debug images
     :return: average character length, median line separation and image contours
     """
     # Compute average character length based on connected components analysis
-    char_length, thresh_chars, chars_array = compute_char_length(thresh=thresh)
+    char_length, thresh_chars, chars_array = compute_char_length(thresh=thresh, debug_dir=debug_dir)
 
     if char_length is None:
         return None, None, None
@@ -416,6 +523,7 @@ def compute_img_metrics(thresh: np.ndarray) -> tuple[Optional[float], Optional[f
     # Compute median separation between rows
     median_line_sep, contours = compute_median_line_sep(thresh_chars=thresh_chars,
                                                         chars_array=chars_array,
-                                                        char_length=char_length)
+                                                        char_length=char_length,
+                                                        debug_dir=debug_dir)
 
     return char_length, median_line_sep, contours

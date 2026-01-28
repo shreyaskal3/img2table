@@ -1,5 +1,7 @@
+from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 import polars as pl
 
@@ -79,8 +81,15 @@ def deduplicate_tables(identified_tables: list[Table], existing_tables: list[Tab
     return final_tables
 
 
-def identify_borderless_tables(thresh: np.ndarray, lines: list[Line], char_length: float, median_line_sep: float,
-                               contours: list[Cell], existing_tables: list[Table]) -> list[Table]:
+def identify_borderless_tables(
+    thresh: np.ndarray,
+    lines: list[Line],
+    char_length: float,
+    median_line_sep: float,
+    contours: list[Cell],
+    existing_tables: list[Table],
+    debug_dir: Optional[str | Path] = None,
+) -> list[Table]:
     """
     Identify borderless tables in image
     :param thresh: threshold image array
@@ -89,14 +98,50 @@ def identify_borderless_tables(thresh: np.ndarray, lines: list[Line], char_lengt
     :param median_line_sep: median line separation
     :param contours: list of image contours
     :param existing_tables: list of detected bordered tables
+    :param debug_dir: optional directory to dump debug images
     :return: list of detected borderless tables
     """
+    debug_dir_path = Path(debug_dir) if debug_dir is not None else None
+    if debug_dir_path is not None:
+        debug_dir_path.mkdir(parents=True, exist_ok=True)
+
+    def write_debug(name: str, image: np.ndarray) -> None:
+        if debug_dir_path is None:
+            return
+        if image.dtype == np.bool_:
+            image = image.astype(np.uint8) * 255
+        elif image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(debug_dir_path / f"{name}.png"), image)
+
+    write_debug("borderless_thresh", thresh)
+
+    if debug_dir_path is not None:
+        base = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+        contours_overlay = base.copy()
+        for c in contours or []:
+            cv2.rectangle(contours_overlay, (c.x1, c.y1), (c.x2 - 1, c.y2 - 1), (0, 0, 255), 1)
+        write_debug("borderless_contours_overlay", contours_overlay)
+
+        lines_overlay = base.copy()
+        for line in lines or []:
+            if line.horizontal:
+                color = (0, 255, 0)
+            elif line.vertical:
+                color = (0, 0, 255)
+            else:
+                color = (0, 255, 255)
+            cv2.line(lines_overlay, (line.x1, line.y1), (line.x2, line.y2), color, 1)
+        write_debug("borderless_lines_overlay", lines_overlay)
+
     # Segment image and identify parts that can correspond to tables
+    segment_debug = (debug_dir_path / "segment") if debug_dir_path is not None else None
     table_segments = segment_image(thresh=thresh,
                                    lines=lines,
                                    char_length=char_length,
                                    median_line_sep=median_line_sep,
-                                   existing_tables=existing_tables)
+                                   existing_tables=existing_tables,
+                                   debug_dir=segment_debug)
 
     # In each segment, create groups of rows and identify tables
     tables = []
@@ -125,5 +170,16 @@ def identify_borderless_tables(thresh: np.ndarray, lines: list[Line], char_lengt
                     if corrected_table:
                         tables.append(corrected_table)
 
-    return deduplicate_tables(identified_tables=tables,
-                              existing_tables=existing_tables)
+    tables = deduplicate_tables(identified_tables=tables,
+                                existing_tables=existing_tables)
+
+    if debug_dir_path is not None:
+        tables_overlay = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+        for table in tables:
+            cv2.rectangle(tables_overlay, (table.x1, table.y1), (table.x2 - 1, table.y2 - 1), (255, 128, 0), 2)
+            label = f"{table.nb_rows}x{table.nb_columns}"
+            cv2.putText(tables_overlay, label, (table.x1, max(0, table.y1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 128, 0), 1, cv2.LINE_AA)
+        write_debug("borderless_tables_overlay", tables_overlay)
+
+    return tables
