@@ -1,7 +1,11 @@
 import random
+from pathlib import Path
 from dataclasses import dataclass
 from queue import PriorityQueue
-from typing import Union
+from typing import Optional, Union
+
+import cv2
+import numpy as np
 
 from img2table.tables import cluster_items
 from img2table.tables.objects.cell import Cell
@@ -91,20 +95,57 @@ def identify_remaining_segments(searched_rectangle: Rectangle,
     return [seg.cell for seg in segments]
 
 
-def get_vertical_ws(image_segment: ImageSegment, char_length: float, lines: list[Line]) -> list[Cell]:
+def get_vertical_ws(
+    image_segment: ImageSegment,
+    char_length: float,
+    lines: list[Line],
+    debug_dir: Optional[str | Path] = None,
+    debug_image: Optional[np.ndarray] = None,
+) -> list[Cell]:
     """
     Identify vertical whitespaces that can correspond to column delimiters in document
     :param image_segment: segment corresponding to the image
     :param char_length: average character length
     :param lines: list of lines identified in image
+    :param debug_dir: optional directory to dump debug images
+    :param debug_image: optional image to draw debug overlays on
     :return: list of vertical whitespaces that can correspond to column delimiters in document
     """
+    debug_dir_path = Path(debug_dir) if debug_dir is not None else None
+    if debug_dir_path is not None:
+        debug_dir_path.mkdir(parents=True, exist_ok=True)
+
+    def write_debug(name: str, image: np.ndarray) -> None:
+        if debug_dir_path is None:
+            return
+        if image.dtype == np.bool_:
+            image = image.astype(np.uint8) * 255
+        elif image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(debug_dir_path / f"{name}.png"), image)
+
+    def base_overlay() -> np.ndarray:
+        if debug_image is None:
+            base = np.zeros((image_segment.y2, image_segment.x2), dtype=np.uint8)
+        else:
+            base = debug_image.copy()
+        if base.ndim == 2:
+            base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+        return base
+
     # Identify vertical whitespaces in segment that represent at least half of the image segment
     v_ws = get_whitespaces(segment=image_segment, vertical=True, pct=0.5)
     v_ws = [ws for ws in v_ws if ws.width >= char_length or ws.x1 == image_segment.x1 or ws.x2 == image_segment.x2]
 
     if len(v_ws) == 0:
         return []
+
+    if debug_dir_path is not None:
+        overlay = base_overlay()
+        cv2.rectangle(overlay, (image_segment.x1, image_segment.y1), (image_segment.x2 - 1, image_segment.y2 - 1), (255, 0, 0), 1)
+        for ws in v_ws:
+            cv2.rectangle(overlay, (ws.x1, ws.y1), (ws.x2 - 1, ws.y2 - 1), (0, 255, 0), 1)
+        write_debug("vertical_ws_initial", overlay)
 
     # Cut whitespaces with horizontal lines
     line_ws = []
@@ -131,6 +172,15 @@ def get_vertical_ws(image_segment: ImageSegment, char_length: float, lines: list
     if len(line_ws) == 0:
         return []
 
+    if debug_dir_path is not None:
+        overlay = base_overlay()
+        cv2.rectangle(overlay, (image_segment.x1, image_segment.y1), (image_segment.x2 - 1, image_segment.y2 - 1), (255, 0, 0), 1)
+        for line in h_lines:
+            cv2.line(overlay, (line.x1, line.y1), (line.x2, line.y2), (0, 0, 255), 1)
+        for ws in line_ws:
+            cv2.rectangle(overlay, (ws.x1, ws.y1), (ws.x2 - 1, ws.y2 - 1), (255, 165, 0), 1)
+        write_debug("vertical_ws_cut", overlay)
+
     # Create groups of adjacent whitespaces
     line_ws = sorted(line_ws, key=lambda ws: ws.x1 + ws.x2)
     seq = iter(line_ws)
@@ -153,8 +203,17 @@ def get_vertical_ws(image_segment: ImageSegment, char_length: float, lines: list
         line_ws_groups[-1].append(ws)
 
     # Keep only the tallest whitespace in each group
-    return [sorted([ws for ws in cl if ws.height == max([w.height for w in cl])], key=lambda w: w.area).pop()
-            for cl in line_ws_groups]
+    final_ws = [sorted([ws for ws in cl if ws.height == max([w.height for w in cl])], key=lambda w: w.area).pop()
+                for cl in line_ws_groups]
+
+    if debug_dir_path is not None:
+        overlay = base_overlay()
+        cv2.rectangle(overlay, (image_segment.x1, image_segment.y1), (image_segment.x2 - 1, image_segment.y2 - 1), (255, 0, 0), 1)
+        for ws in final_ws:
+            cv2.rectangle(overlay, (ws.x1, ws.y1), (ws.x2 - 1, ws.y2 - 1), (0, 255, 255), 2)
+        write_debug("vertical_ws_final", overlay)
+
+    return final_ws
 
 
 def is_column_section(ws_group: list[Cell]) -> bool:
@@ -194,13 +253,60 @@ def bottom_matches(col_1: Cell, col_2: Cell) -> bool:
     return abs(col_1.y2 - col_2.y2) / max(col_1.height, col_2.height) <= 0.05
 
 
-def identify_column_groups(image_segment: ImageSegment, vertical_ws: list[Cell]) -> list[list[Cell]]:
+def identify_column_groups(
+    image_segment: ImageSegment,
+    vertical_ws: list[Cell],
+    debug_dir: Optional[str | Path] = None,
+    debug_image: Optional[np.ndarray] = None,
+) -> list[list[Cell]]:
     """
     Identify groups of whitespaces that correspond to document columns
     :param image_segment: segment corresponding to the image
     :param vertical_ws: list of vertical whitespaces that can correspond to column delimiters in document
+    :param debug_dir: optional directory to dump debug images
+    :param debug_image: optional image to draw debug overlays on
     :return: groups of whitespaces that correspond to document columns
     """
+    debug_dir_path = Path(debug_dir) if debug_dir is not None else None
+    if debug_dir_path is not None:
+        debug_dir_path.mkdir(parents=True, exist_ok=True)
+
+    def write_debug(name: str, image: np.ndarray) -> None:
+        if debug_dir_path is None:
+            return
+        if image.dtype == np.bool_:
+            image = image.astype(np.uint8) * 255
+        elif image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(debug_dir_path / f"{name}.png"), image)
+
+    def base_overlay() -> np.ndarray:
+        if debug_image is None:
+            base = np.zeros((image_segment.y2, image_segment.x2), dtype=np.uint8)
+        else:
+            base = debug_image.copy()
+        if base.ndim == 2:
+            base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+        return base
+
+    def draw_groups(groups: list[list[Cell]], name: str) -> None:
+        if debug_dir_path is None:
+            return
+        overlay = base_overlay()
+        cv2.rectangle(overlay, (image_segment.x1, image_segment.y1), (image_segment.x2 - 1, image_segment.y2 - 1), (255, 0, 0), 1)
+        palette = [
+            (0, 255, 0),
+            (0, 255, 255),
+            (255, 0, 255),
+            (255, 128, 0),
+            (0, 128, 255),
+        ]
+        for idx, group in enumerate(groups):
+            color = palette[idx % len(palette)]
+            for ws in group:
+                cv2.rectangle(overlay, (ws.x1, ws.y1), (ws.x2 - 1, ws.y2 - 1), color, 2)
+        write_debug(name, overlay)
+
     # Identify whitespaces in the middle of the image as well as on edges
     middle_ws = [ws for ws in vertical_ws if
                  len({ws.x1, ws.x2}.intersection({image_segment.x1, image_segment.x2})) == 0]
@@ -209,11 +315,16 @@ def identify_column_groups(image_segment: ImageSegment, vertical_ws: list[Cell])
     # Create groups of columns based on top/bottom alignment
     top_col_groups = [cl + edge_ws for cl in cluster_items(items=middle_ws, clustering_func=top_matches)]
     bottom_col_groups = [cl + edge_ws for cl in cluster_items(items=middle_ws, clustering_func=bottom_matches)]
+    if debug_dir_path is not None:
+        draw_groups(top_col_groups, "column_groups_top")
+        draw_groups(bottom_col_groups, "column_groups_bottom")
 
     # Identify groups that correspond to columns
     col_groups = sorted([gp for gp in top_col_groups + bottom_col_groups if is_column_section(ws_group=gp)],
                         key=len,
                         reverse=True)
+    if debug_dir_path is not None:
+        draw_groups(col_groups, "column_groups_section")
 
     # Get groups that contain all relevant whitespaces
     filtered_col_groups = []
@@ -223,6 +334,8 @@ def identify_column_groups(image_segment: ImageSegment, vertical_ws: list[Cell])
                        and len({ws.x1, ws.x2}.intersection({image_segment.x1, image_segment.x2})) == 0]
         if len(set(matching_ws).difference(set(col_gp))) == 0:
             filtered_col_groups.append(col_gp)
+    if debug_dir_path is not None:
+        draw_groups(filtered_col_groups, "column_groups_filtered")
 
     if len(filtered_col_groups) == 0:
         return []
@@ -233,6 +346,9 @@ def identify_column_groups(image_segment: ImageSegment, vertical_ws: list[Cell])
     for col_gp in seq:
         if not any(set(col_gp).intersection(set(gp)) == set(col_gp) for gp in dedup_col_groups):
             dedup_col_groups.append(col_gp)
+
+    if debug_dir_path is not None:
+        draw_groups(dedup_col_groups, "column_groups_dedup")
 
     return dedup_col_groups
 
@@ -305,22 +421,38 @@ def get_segments_from_columns(image_segment: ImageSegment, column_groups: list[l
     return img_segments + missing_segments
 
 
-def segment_image_columns(image_segment: ImageSegment, char_length: float, lines: list[Line]) -> list[ImageSegment]:
+def segment_image_columns(
+    image_segment: ImageSegment,
+    char_length: float,
+    lines: list[Line],
+    debug_dir: Optional[str | Path] = None,
+    debug_image: Optional[np.ndarray] = None,
+) -> list[ImageSegment]:
     """
     Create image segments by identifying columns
     :param image_segment: segment corresponding to the image
     :param char_length: average character length
     :param lines: list of lines identified in image
+    :param debug_dir: optional directory to dump debug images
+    :param debug_image: optional image to draw debug overlays on
     :return: list of segments corresponding to image
     """
+    debug_dir_path = Path(debug_dir) if debug_dir is not None else None
+    if debug_dir_path is not None:
+        debug_dir_path.mkdir(parents=True, exist_ok=True)
+
     # Identify vertical whitespaces that can correspond to column delimiters in document
     vertical_ws = get_vertical_ws(image_segment=image_segment,
                                   char_length=char_length,
-                                  lines=lines)
+                                  lines=lines,
+                                  debug_dir=debug_dir_path / "whitespaces" if debug_dir_path is not None else None,
+                                  debug_image=debug_image)
 
     # Identify column groups
     column_groups = identify_column_groups(image_segment=image_segment,
-                                           vertical_ws=vertical_ws)
+                                           vertical_ws=vertical_ws,
+                                           debug_dir=debug_dir_path / "groups" if debug_dir_path is not None else None,
+                                           debug_image=debug_image)
 
     if len(column_groups) == 0:
         return [image_segment]

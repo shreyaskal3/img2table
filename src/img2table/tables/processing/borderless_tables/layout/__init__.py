@@ -56,8 +56,10 @@ def segment_image(
     write_debug("segment_text_mask", text_thresh)
 
     # Identify image elements
+    elements_debug = (debug_dir_path / "elements") if debug_dir_path is not None else None
     img_elements = get_image_elements(thresh=text_thresh,
-                                      char_length=char_length)
+                                      char_length=char_length,
+                                      debug_dir=elements_debug)
 
     if len(img_elements) == 0:
         return []
@@ -72,9 +74,12 @@ def segment_image(
     y_min, y_max = min([el.y1 for el in img_elements]), max([el.y2 for el in img_elements])
     image_segment = ImageSegment(x1=0, y1=y_min, x2=thresh.shape[1], y2=y_max, elements=img_elements)
 
+    columns_debug = (debug_dir_path / "columns") if debug_dir_path is not None else None
     col_segments = segment_image_columns(image_segment=image_segment,
                                          char_length=char_length,
-                                         lines=lines)
+                                         lines=lines,
+                                         debug_dir=columns_debug,
+                                         debug_image=text_thresh)
 
     if debug_dir_path is not None:
         col_overlay = cv2.cvtColor(text_thresh, cv2.COLOR_GRAY2BGR)

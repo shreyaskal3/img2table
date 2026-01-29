@@ -15,7 +15,7 @@ if SRC_ROOT.exists():
     sys.path.insert(0, str(SRC_ROOT))
 
 # Default paths so you can run without CLI args
-DEFAULT_IMAGE = "may-june (1)_page-0001.jpg"
+DEFAULT_IMAGE = "dark.png"
 DEFAULT_OUT = "./tmp/lines_overlay.png"
 DEFAULT_OUT_DIR = "./tmp"
 
